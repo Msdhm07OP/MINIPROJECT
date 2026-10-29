@@ -1,59 +1,157 @@
-import { db } from '../config/database.js';
-import { validateBookingRequest } from './validationService.js';
-import {
-  calculateReservedInterval,
-  checkIntervalOverlap
-} from '../utils/timeHelpers.js';
+import bookingRepo from '../repositories/BookingRepository.js';
+import { withRetry, transaction } from '../database/config.js';
+import { calculateReservedInterval, isWithinOperatingHours } from '../utils/timeHelpers.js';
+import { bookingRequestSchema } from './validation/schemas.js';
+import logger from '../utils/logger/index.js';
 
 /**
- * Find available hall using the required algorithm
- * @param {object} request - Booking request
- * @returns {object|null} { hallId, venueId, venueName, hallName } or null
+ * Core scheduling service with concurrency-safe booking allocation
  */
-const findAvailableHall = (request) => {
-  const {
-    event_date,
-    event_start,
-    event_end,
-    attendees,
-    preferred_venue_id,
-    projectors_requested = 0,
-    audio_systems_requested = 0,
-    staff_requested = 0,
-    exclude_booking_id = null // For rescheduling
-  } = request;
+class SchedulingService {
+  /**
+   * Confirm a booking with full concurrency safety
+   * @param {object} request - Booking request
+   * @param {string} correlationId - Request correlation ID
+   * @returns {Promise<object>} { success: boolean, booking: object, message: string }
+   */
+  async confirmBooking(request, correlationId = null) {
+    // Validate request
+    const validated = bookingRequestSchema.parse(request);
 
-  const { reservedStart, reservedEnd } = calculateReservedInterval(
-    event_date,
-    event_start,
-    event_end
-  );
+    // Additional validation
+    const validationErrors = await this.validateBookingRequest(validated);
+    if (validationErrors.length > 0) {
+      return {
+        success: false,
+        booking: null,
+        message: validationErrors.join('; '),
+        errors: validationErrors
+      };
+    }
 
-  // Step 1: Try preferred venue first
-  const result = tryVenue(
-    preferred_venue_id,
-    event_date,
-    reservedStart,
-    reservedEnd,
-    attendees,
-    projectors_requested,
-    audio_systems_requested,
-    staff_requested,
-    exclude_booking_id
-  );
+    // Execute booking with retry logic for serialization failures
+    return await withRetry(async () => {
+      return await transaction(async (client) => {
+        // CRITICAL: Acquire advisory lock for this venue/date
+        const locked = await bookingRepo.acquireAllocationLock(
+          client,
+          validated.preferred_venue_id,
+          validated.event_date
+        );
 
-  if (result) {
-    return result;
+        if (!locked) {
+          logger.warn('Failed to acquire allocation lock', {
+            venueId: validated.preferred_venue_id,
+            eventDate: validated.event_date,
+            correlationId
+          });
+          throw new Error('Unable to acquire resource lock. Please retry.');
+        }
+
+        // Calculate reserved interval
+        const { reservedStart, reservedEnd } = calculateReservedInterval(
+          validated.event_date,
+          validated.event_start,
+          validated.event_end
+        );
+
+        // Find available hall using required algorithm
+        const allocation = await this.findAvailableHall(client, {
+          ...validated,
+          reservedStart,
+          reservedEnd
+        });
+
+        if (!allocation) {
+          // No feasible allocation - create rejected booking
+          const rejectionReason = await this.generateRejectionReason(client, validated);
+
+          const booking = await bookingRepo.createBookingWithAllocations(
+            client,
+            {
+              client_id: validated.client_id,
+              hall_id: null,
+              venue_id: validated.preferred_venue_id,
+              event_name: validated.event_name,
+              event_date: validated.event_date,
+              event_start: validated.event_start,
+              event_end: validated.event_end,
+              reserved_start: reservedStart,
+              reserved_end: reservedEnd,
+              attendees: validated.attendees,
+              status: 'rejected',
+              rejection_reason: rejectionReason,
+              rejection_code: 'NO_AVAILABILITY',
+              correlation_id: correlationId
+            },
+            []
+          );
+
+          logger.info('Booking rejected', {
+            bookingId: booking.id,
+            reason: rejectionReason,
+            correlationId
+          });
+
+          return {
+            success: false,
+            booking,
+            message: rejectionReason
+          };
+        }
+
+        // Create confirmed booking with resource allocations
+        const resourceAllocations = await this.buildResourceAllocations(client, {
+          projectors_requested: validated.projectors_requested,
+          audio_systems_requested: validated.audio_systems_requested,
+          staff_requested: validated.staff_requested
+        });
+
+        const booking = await bookingRepo.createBookingWithAllocations(
+          client,
+          {
+            client_id: validated.client_id,
+            hall_id: allocation.hallId,
+            venue_id: allocation.venueId,
+            event_name: validated.event_name,
+            event_date: validated.event_date,
+            event_start: validated.event_start,
+            event_end: validated.event_end,
+            reserved_start: reservedStart,
+            reserved_end: reservedEnd,
+            attendees: validated.attendees,
+            status: 'confirmed',
+            correlation_id: correlationId
+          },
+          resourceAllocations
+        );
+
+        logger.info('Booking confirmed', {
+          bookingId: booking.id,
+          venueId: allocation.venueId,
+          hallId: allocation.hallId,
+          correlationId
+        });
+
+        return {
+          success: true,
+          booking,
+          message: `Event confirmed at ${allocation.venueName} - ${allocation.hallName}`,
+          allocation
+        };
+      }, { isolationLevel: 'READ COMMITTED' });
+    }, { maxRetries: 3 });
   }
 
-  // Step 2: Try other venues in deterministic order (ascending venue ID)
-  const otherVenues = db.prepare(`
-    SELECT id FROM venues WHERE id != ? ORDER BY id ASC
-  `).all(preferred_venue_id);
-
-  for (const venue of otherVenues) {
-    const result = tryVenue(
-      venue.id,
+  /**
+   * Find available hall using required algorithm
+   * @param {object} client - Database client
+   * @param {object} request - Validated request with reserved times
+   * @returns {Promise<object|null>} Allocation details or null
+   */
+  async findAvailableHall(client, request) {
+    const {
+      preferred_venue_id,
       event_date,
       reservedStart,
       reservedEnd,
@@ -61,60 +159,97 @@ const findAvailableHall = (request) => {
       projectors_requested,
       audio_systems_requested,
       staff_requested,
-      exclude_booking_id
+      exclude_booking_id = null
+    } = request;
+
+    // Step 1: Try preferred venue first
+    const preferredResult = await this.tryVenue(client, {
+      venueId: preferred_venue_id,
+      eventDate: event_date,
+      reservedStart,
+      reservedEnd,
+      attendees,
+      projectorsRequested: projectors_requested,
+      audioSystemsRequested: audio_systems_requested,
+      staffRequested: staff_requested,
+      excludeBookingId: exclude_booking_id
+    });
+
+    if (preferredResult) {
+      return preferredResult;
+    }
+
+    // Step 2: Try other venues in deterministic order (ascending ID)
+    const otherVenuesResult = await client.query(
+      'SELECT id FROM venues WHERE id != $1 ORDER BY id ASC',
+      [preferred_venue_id]
     );
 
-    if (result) {
-      return result;
+    for (const venue of otherVenuesResult.rows) {
+      const result = await this.tryVenue(client, {
+        venueId: venue.id,
+        eventDate: event_date,
+        reservedStart,
+        reservedEnd,
+        attendees,
+        projectorsRequested: projectors_requested,
+        audioSystemsRequested: audio_systems_requested,
+        staffRequested: staff_requested,
+        excludeBookingId: exclude_booking_id
+      });
+
+      if (result) {
+        return result;
+      }
     }
+
+    return null; // No feasible allocation found
   }
 
-  return null; // No feasible allocation found
-};
+  /**
+   * Try to allocate at a specific venue
+   * @param {object} client
+   * @param {object} params
+   * @returns {Promise<object|null>}
+   */
+  async tryVenue(client, params) {
+    const {
+      venueId,
+      eventDate,
+      reservedStart,
+      reservedEnd,
+      attendees,
+      projectorsRequested,
+      audioSystemsRequested,
+      staffRequested,
+      excludeBookingId
+    } = params;
 
-/**
- * Try to find a suitable hall and resources at a specific venue
- * @param {number} venueId
- * @param {string} eventDate
- * @param {string} reservedStart
- * @param {string} reservedEnd
- * @param {number} attendees
- * @param {number} projectorsRequested
- * @param {number} audioSystemsRequested
- * @param {number} staffRequested
- * @param {number|null} excludeBookingId
- * @returns {object|null}
- */
-const tryVenue = (
-  venueId,
-  eventDate,
-  reservedStart,
-  reservedEnd,
-  attendees,
-  projectorsRequested,
-  audioSystemsRequested,
-  staffRequested,
-  excludeBookingId
-) => {
-  // Get halls with sufficient capacity, ordered by capacity ascending then id ascending
-  const halls = db.prepare(`
-    SELECT h.id, h.name, h.capacity, v.name as venue_name
-    FROM halls h
-    JOIN venues v ON h.venue_id = v.id
-    WHERE h.venue_id = ? AND h.capacity >= ?
-    ORDER BY h.capacity ASC, h.id ASC
-  `).all(venueId, attendees);
+    // Get halls with sufficient capacity (smallest first)
+    const halls = await bookingRepo.getHallsByCapacity(client, venueId, attendees);
 
-  if (halls.length === 0) {
-    return null; // No hall with sufficient capacity
-  }
+    if (halls.length === 0) {
+      return null; // No hall with sufficient capacity
+    }
 
-  // Check each hall (smallest first)
-  for (const hall of halls) {
-    // Check hall availability
-    if (isHallAvailable(hall.id, eventDate, reservedStart, reservedEnd, excludeBookingId)) {
-      // Check resource availability at this venue
-      if (areResourcesAvailable(
+    // Check each hall (smallest first due to ORDER BY in query)
+    for (const hall of halls) {
+      // Check hall availability
+      const hallAvailable = await bookingRepo.isHallAvailable(
+        client,
+        hall.id,
+        eventDate,
+        reservedStart,
+        reservedEnd,
+        excludeBookingId
+      );
+
+      if (!hallAvailable) {
+        continue; // Hall has conflict, try next
+      }
+
+      // Check resource availability
+      const resourcesAvailable = await this.checkResourceAvailability(client, {
         venueId,
         eventDate,
         reservedStart,
@@ -123,604 +258,459 @@ const tryVenue = (
         audioSystemsRequested,
         staffRequested,
         excludeBookingId
-      )) {
+      });
+
+      if (resourcesAvailable) {
+        // Found feasible allocation
+        const venueResult = await client.query(
+          'SELECT name FROM venues WHERE id = $1',
+          [venueId]
+        );
+
         return {
           hallId: hall.id,
-          venueId: venueId,
-          venueName: hall.venue_name,
           hallName: hall.name,
-          hallCapacity: hall.capacity
+          hallCapacity: hall.capacity,
+          venueId,
+          venueName: venueResult.rows[0].name
         };
       }
     }
+
+    return null; // No feasible combination at this venue
   }
 
-  return null; // No feasible hall and resource combination at this venue
-};
-
-/**
- * Check if a hall is available during the reserved interval
- * @param {number} hallId
- * @param {string} eventDate
- * @param {string} reservedStart
- * @param {string} reservedEnd
- * @param {number|null} excludeBookingId
- * @returns {boolean}
- */
-const isHallAvailable = (hallId, eventDate, reservedStart, reservedEnd, excludeBookingId) => {
-  let query = `
-    SELECT id, reserved_start, reserved_end
-    FROM bookings
-    WHERE hall_id = ?
-      AND event_date = ?
-      AND status = 'confirmed'
-  `;
-
-  const params = [hallId, eventDate];
-
-  if (excludeBookingId) {
-    query += ` AND id != ?`;
-    params.push(excludeBookingId);
-  }
-
-  const conflictingBookings = db.prepare(query).all(...params);
-
-  // Check for overlap with any confirmed booking
-  for (const booking of conflictingBookings) {
-    if (checkIntervalOverlap(
+  /**
+   * Check resource availability using sweep-line algorithm
+   * @param {object} client
+   * @param {object} params
+   * @returns {Promise<boolean>}
+   */
+  async checkResourceAvailability(client, params) {
+    const {
+      venueId,
       eventDate,
       reservedStart,
       reservedEnd,
-      booking.reserved_start,
-      booking.reserved_end
-    )) {
-      return false; // Conflict found
-    }
-  }
+      projectorsRequested,
+      audioSystemsRequested,
+      staffRequested,
+      excludeBookingId
+    } = params;
 
-  return true; // No conflicts
-};
+    // Get venue resource capacity
+    const capacity = await bookingRepo.getVenueResourceCapacity(client, venueId);
 
-/**
- * Check if shared resources are available at a venue during the reserved interval
- * Uses sweep-line algorithm to calculate concurrent resource usage
- * @param {number} venueId
- * @param {string} eventDate
- * @param {string} reservedStart
- * @param {string} reservedEnd
- * @param {number} projectorsRequested
- * @param {number} audioSystemsRequested
- * @param {number} staffRequested
- * @param {number|null} excludeBookingId
- * @returns {boolean}
- */
-const areResourcesAvailable = (
-  venueId,
-  eventDate,
-  reservedStart,
-  reservedEnd,
-  projectorsRequested,
-  audioSystemsRequested,
-  staffRequested,
-  excludeBookingId
-) => {
-  // Get venue resource capacity
-  const venueResources = db.prepare(`
-    SELECT projectors, audio_systems, support_staff
-    FROM venue_resources
-    WHERE venue_id = ?
-  `).get(venueId);
-
-  if (!venueResources) {
-    return false;
-  }
-
-  // Get all confirmed bookings at this venue on this date that overlap with our interval
-  let query = `
-    SELECT
-      reserved_start,
-      reserved_end,
-      projectors_requested,
-      audio_systems_requested,
-      staff_requested
-    FROM bookings
-    WHERE venue_id = ?
-      AND event_date = ?
-      AND status = 'confirmed'
-  `;
-
-  const params = [venueId, eventDate];
-
-  if (excludeBookingId) {
-    query += ` AND id != ?`;
-    params.push(excludeBookingId);
-  }
-
-  const existingBookings = db.prepare(query).all(...params);
-
-  // Filter to only overlapping bookings
-  const overlappingBookings = existingBookings.filter(booking =>
-    checkIntervalOverlap(
+    // Get overlapping bookings
+    const overlappingBookings = await bookingRepo.getOverlappingBookings(
+      client,
+      venueId,
       eventDate,
       reservedStart,
       reservedEnd,
-      booking.reserved_start,
-      booking.reserved_end
-    )
-  );
-
-  // Sweep-line algorithm: create events for all interval boundaries
-  const events = [];
-
-  // Add candidate booking
-  events.push({
-    time: reservedStart,
-    type: 'start',
-    projectors: projectorsRequested,
-    audio: audioSystemsRequested,
-    staff: staffRequested
-  });
-  events.push({
-    time: reservedEnd,
-    type: 'end',
-    projectors: projectorsRequested,
-    audio: audioSystemsRequested,
-    staff: staffRequested
-  });
-
-  // Add existing bookings
-  for (const booking of overlappingBookings) {
-    events.push({
-      time: booking.reserved_start,
-      type: 'start',
-      projectors: booking.projectors_requested,
-      audio: booking.audio_systems_requested,
-      staff: booking.staff_requested
-    });
-    events.push({
-      time: booking.reserved_end,
-      type: 'end',
-      projectors: booking.projectors_requested,
-      audio: booking.audio_systems_requested,
-      staff: booking.staff_requested
-    });
-  }
-
-  // Sort events by time, with 'end' events before 'start' events at same time
-  events.sort((a, b) => {
-    if (a.time === b.time) {
-      return a.type === 'end' ? -1 : 1;
-    }
-    return a.time.localeCompare(b.time);
-  });
-
-  // Sweep through events and track concurrent usage
-  let currentProjectors = 0;
-  let currentAudio = 0;
-  let currentStaff = 0;
-
-  for (const event of events) {
-    if (event.type === 'start') {
-      currentProjectors += event.projectors;
-      currentAudio += event.audio;
-      currentStaff += event.staff;
-
-      // Check if capacity is exceeded
-      if (currentProjectors > venueResources.projectors ||
-          currentAudio > venueResources.audio_systems ||
-          currentStaff > venueResources.support_staff) {
-        return false;
-      }
-    } else {
-      currentProjectors -= event.projectors;
-      currentAudio -= event.audio;
-      currentStaff -= event.staff;
-    }
-  }
-
-  return true; // Resources are available
-};
-
-/**
- * Generate detailed rejection reason
- * @param {object} request
- * @returns {string}
- */
-const generateRejectionReason = (request) => {
-  const {
-    event_date,
-    event_start,
-    event_end,
-    attendees,
-    preferred_venue_id,
-    projectors_requested = 0,
-    audio_systems_requested = 0,
-    staff_requested = 0
-  } = request;
-
-  const { reservedStart, reservedEnd } = calculateReservedInterval(
-    event_date,
-    event_start,
-    event_end
-  );
-
-  // Check all venues for detailed feedback
-  const venues = db.prepare('SELECT id, name FROM venues ORDER BY id ASC').all();
-
-  const reasons = [];
-
-  for (const venue of venues) {
-    const venueResources = db.prepare(`
-      SELECT projectors, audio_systems, support_staff
-      FROM venue_resources
-      WHERE venue_id = ?
-    `).get(venue.id);
-
-    const halls = db.prepare(`
-      SELECT id, name, capacity
-      FROM halls
-      WHERE venue_id = ? AND capacity >= ?
-      ORDER BY capacity ASC
-    `).all(venue.id, attendees);
-
-    if (halls.length === 0) {
-      reasons.push(`${venue.name}: No hall with sufficient capacity for ${attendees} attendees`);
-      continue;
-    }
-
-    let hallAvailable = false;
-    let resourcesAvailable = false;
-
-    for (const hall of halls) {
-      if (isHallAvailable(hall.id, event_date, reservedStart, reservedEnd, null)) {
-        hallAvailable = true;
-        break;
-      }
-    }
-
-    if (!hallAvailable) {
-      reasons.push(`${venue.name}: All suitable halls are booked during ${reservedStart} - ${reservedEnd}`);
-      continue;
-    }
-
-    if (areResourcesAvailable(
-      venue.id,
-      event_date,
-      reservedStart,
-      reservedEnd,
-      projectors_requested,
-      audio_systems_requested,
-      staff_requested,
-      null
-    )) {
-      resourcesAvailable = true;
-    } else {
-      // Determine which resource is the bottleneck
-      const bottlenecks = [];
-      if (!areResourcesAvailable(venue.id, event_date, reservedStart, reservedEnd, projectors_requested, 0, 0, null)) {
-        bottlenecks.push(`projectors (available: ${venueResources.projectors}, needed: ${projectors_requested})`);
-      }
-      if (!areResourcesAvailable(venue.id, event_date, reservedStart, reservedEnd, 0, audio_systems_requested, 0, null)) {
-        bottlenecks.push(`audio systems (available: ${venueResources.audio_systems}, needed: ${audio_systems_requested})`);
-      }
-      if (!areResourcesAvailable(venue.id, event_date, reservedStart, reservedEnd, 0, 0, staff_requested, null)) {
-        bottlenecks.push(`support staff (available: ${venueResources.support_staff}, needed: ${staff_requested})`);
-      }
-
-      reasons.push(`${venue.name}: Insufficient ${bottlenecks.join(', ')} during the requested time`);
-    }
-  }
-
-  if (reasons.length === 0) {
-    return 'No suitable venue, hall, and resource combination available';
-  }
-
-  const preferredVenue = venues.find(v => v.id === preferred_venue_id);
-  return `Cannot accommodate request. ${preferredVenue?.name} (preferred): ${reasons.find(r => r.startsWith(preferredVenue?.name)) || 'Not available'}. Other venues: ${reasons.filter(r => !r.startsWith(preferredVenue?.name)).join('; ')}`;
-};
-
-/**
- * Confirm a booking
- * @param {object} request
- * @returns {object} { success: boolean, booking: object|null, message: string }
- */
-export const confirmBooking = (request) => {
-  // Validate request
-  const validation = validateBookingRequest(request);
-  if (!validation.valid) {
-    return {
-      success: false,
-      booking: null,
-      message: validation.errors.join('; ')
-    };
-  }
-
-  // Calculate reserved interval
-  const { reservedStart, reservedEnd } = calculateReservedInterval(
-    request.event_date,
-    request.event_start,
-    request.event_end
-  );
-
-  // Find available hall
-  const allocation = findAvailableHall(request);
-
-  if (!allocation) {
-    // Create rejected booking record
-    const rejectionReason = generateRejectionReason(request);
-
-    const stmt = db.prepare(`
-      INSERT INTO bookings (
-        client_id, venue_id, event_name, event_date,
-        event_start, event_end, reserved_start, reserved_end,
-        attendees, projectors_requested, audio_systems_requested,
-        staff_requested, status, rejection_reason
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'rejected', ?)
-    `);
-
-    const result = stmt.run(
-      request.client_id,
-      request.preferred_venue_id,
-      request.event_name,
-      request.event_date,
-      request.event_start,
-      request.event_end,
-      reservedStart,
-      reservedEnd,
-      request.attendees,
-      request.projectors_requested || 0,
-      request.audio_systems_requested || 0,
-      request.staff_requested || 0,
-      rejectionReason
+      excludeBookingId
     );
 
-    const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid);
+    // Build sweep-line events
+    const events = [];
 
-    return {
-      success: false,
-      booking,
-      message: rejectionReason
-    };
-  }
+    // Add candidate booking
+    events.push({
+      time: reservedStart,
+      type: 'start',
+      projectors: projectorsRequested,
+      audio: audioSystemsRequested,
+      staff: staffRequested
+    });
+    events.push({
+      time: reservedEnd,
+      type: 'end',
+      projectors: projectorsRequested,
+      audio: audioSystemsRequested,
+      staff: staffRequested
+    });
 
-  // Create confirmed booking
-  const stmt = db.prepare(`
-    INSERT INTO bookings (
-      client_id, hall_id, venue_id, event_name, event_date,
-      event_start, event_end, reserved_start, reserved_end,
-      attendees, projectors_requested, audio_systems_requested,
-      staff_requested, status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed')
-  `);
+    // Add existing bookings
+    for (const booking of overlappingBookings) {
+      const resources = booking.resources || [];
 
-  const result = stmt.run(
-    request.client_id,
-    allocation.hallId,
-    allocation.venueId,
-    request.event_name,
-    request.event_date,
-    request.event_start,
-    request.event_end,
-    reservedStart,
-    reservedEnd,
-    request.attendees,
-    request.projectors_requested || 0,
-    request.audio_systems_requested || 0,
-    request.staff_requested || 0
-  );
+      const projectors = resources.find(r => r.resource_type === 'projector')?.quantity || 0;
+      const audio = resources.find(r => r.resource_type === 'audio_system')?.quantity || 0;
+      const staff = resources.find(r => r.resource_type === 'support_staff')?.quantity || 0;
 
-  const booking = db.prepare(`
-    SELECT b.*, h.name as hall_name, v.name as venue_name, c.name as client_name
-    FROM bookings b
-    LEFT JOIN halls h ON b.hall_id = h.id
-    JOIN venues v ON b.venue_id = v.id
-    JOIN clients c ON b.client_id = c.id
-    WHERE b.id = ?
-  `).get(result.lastInsertRowid);
+      events.push({
+        time: booking.reserved_start,
+        type: 'start',
+        projectors,
+        audio,
+        staff
+      });
+      events.push({
+        time: booking.reserved_end,
+        type: 'end',
+        projectors,
+        audio,
+        staff
+      });
+    }
 
-  return {
-    success: true,
-    booking,
-    message: `Event confirmed at ${allocation.venueName} - ${allocation.hallName}`
-  };
-};
+    // Sort events (end before start at same time)
+    events.sort((a, b) => {
+      if (a.time === b.time) {
+        return a.type === 'end' ? -1 : 1;
+      }
+      return a.time.localeCompare(b.time);
+    });
 
-/**
- * Cancel a booking
- * @param {number} bookingId
- * @returns {object} { success: boolean, message: string }
- */
-export const cancelBooking = (bookingId) => {
-  const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(bookingId);
+    // Sweep through events
+    let currentProjectors = 0;
+    let currentAudio = 0;
+    let currentStaff = 0;
 
-  if (!booking) {
-    return {
-      success: false,
-      message: 'Booking not found'
-    };
-  }
+    for (const event of events) {
+      if (event.type === 'start') {
+        currentProjectors += event.projectors;
+        currentAudio += event.audio;
+        currentStaff += event.staff;
 
-  if (booking.status === 'cancelled') {
-    return {
-      success: false,
-      message: 'Booking is already cancelled'
-    };
-  }
+        // Check capacity
+        const maxProjectors = capacity.projector?.capacity || 0;
+        const maxAudio = capacity.audio_system?.capacity || 0;
+        const maxStaff = capacity.support_staff?.capacity || 0;
 
-  if (booking.status !== 'confirmed') {
-    return {
-      success: false,
-      message: 'Only confirmed bookings can be cancelled'
-    };
-  }
-
-  // Update booking status to cancelled
-  db.prepare(`
-    UPDATE bookings
-    SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(bookingId);
-
-  return {
-    success: true,
-    message: 'Booking cancelled successfully. Resources have been released.'
-  };
-};
-
-/**
- * Reschedule a booking (atomic operation)
- * @param {number} bookingId
- * @param {object} newRequest - New booking details
- * @returns {object} { success: boolean, booking: object|null, message: string }
- */
-export const rescheduleBooking = (bookingId, newRequest) => {
-  const originalBooking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(bookingId);
-
-  if (!originalBooking) {
-    return {
-      success: false,
-      booking: null,
-      message: 'Booking not found'
-    };
-  }
-
-  if (originalBooking.status !== 'confirmed') {
-    return {
-      success: false,
-      booking: null,
-      message: 'Only confirmed bookings can be rescheduled'
-    };
-  }
-
-  // Validate new request
-  const validation = validateBookingRequest(newRequest);
-  if (!validation.valid) {
-    return {
-      success: false,
-      booking: originalBooking,
-      message: validation.errors.join('; ')
-    };
-  }
-
-  // Calculate new reserved interval
-  const { reservedStart, reservedEnd } = calculateReservedInterval(
-    newRequest.event_date,
-    newRequest.event_start,
-    newRequest.event_end
-  );
-
-  // Find available hall (excluding current booking from conflict check)
-  const allocation = findAvailableHall({
-    ...newRequest,
-    exclude_booking_id: bookingId
-  });
-
-  if (!allocation) {
-    const rejectionReason = generateRejectionReason(newRequest);
-    return {
-      success: false,
-      booking: originalBooking,
-      message: `Cannot reschedule: ${rejectionReason}`
-    };
-  }
-
-  // Update booking atomically
-  db.prepare(`
-    UPDATE bookings
-    SET
-      hall_id = ?,
-      venue_id = ?,
-      event_name = ?,
-      event_date = ?,
-      event_start = ?,
-      event_end = ?,
-      reserved_start = ?,
-      reserved_end = ?,
-      attendees = ?,
-      projectors_requested = ?,
-      audio_systems_requested = ?,
-      staff_requested = ?,
-      updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(
-    allocation.hallId,
-    allocation.venueId,
-    newRequest.event_name,
-    newRequest.event_date,
-    newRequest.event_start,
-    newRequest.event_end,
-    reservedStart,
-    reservedEnd,
-    newRequest.attendees,
-    newRequest.projectors_requested || 0,
-    newRequest.audio_systems_requested || 0,
-    newRequest.staff_requested || 0,
-    bookingId
-  );
-
-  const updatedBooking = db.prepare(`
-    SELECT b.*, h.name as hall_name, v.name as venue_name, c.name as client_name
-    FROM bookings b
-    LEFT JOIN halls h ON b.hall_id = h.id
-    JOIN venues v ON b.venue_id = v.id
-    JOIN clients c ON b.client_id = c.id
-    WHERE b.id = ?
-  `).get(bookingId);
-
-  return {
-    success: true,
-    booking: updatedBooking,
-    message: `Booking rescheduled successfully to ${allocation.venueName} - ${allocation.hallName}`
-  };
-};
-
-/**
- * Get alternative time slots and venues (Innovation feature)
- * @param {object} request
- * @returns {array} Array of alternative suggestions
- */
-export const getAlternatives = (request) => {
-  const alternatives = [];
-  const { event_date, event_start, event_end } = request;
-
-  // Try same day, different times (±1 hour, ±2 hours)
-  const timeOffsets = [60, -60, 120, -120, 180, -180];
-
-  for (const offset of timeOffsets) {
-    const testRequest = { ...request };
-    const [startHour, startMin] = event_start.split(':').map(Number);
-    const [endHour, endMin] = event_end.split(':').map(Number);
-
-    const newStartHour = startHour + Math.floor(offset / 60);
-    const newEndHour = endHour + Math.floor(offset / 60);
-
-    if (newStartHour >= 0 && newStartHour < 24 && newEndHour >= 0 && newEndHour < 24) {
-      testRequest.event_start = `${String(newStartHour).padStart(2, '0')}:${String(startMin).padStart(2, '0')}`;
-      testRequest.event_end = `${String(newEndHour).padStart(2, '0')}:${String(endMin).padStart(2, '0')}`;
-
-      const allocation = findAvailableHall(testRequest);
-      if (allocation) {
-        const { reservedStart, reservedEnd } = calculateReservedInterval(
-          testRequest.event_date,
-          testRequest.event_start,
-          testRequest.event_end
-        );
-
-        alternatives.push({
-          type: 'time_change',
-          event_date: testRequest.event_date,
-          event_start: testRequest.event_start,
-          event_end: testRequest.event_end,
-          venue_id: allocation.venueId,
-          venue_name: allocation.venueName,
-          hall_name: allocation.hallName,
-          reason: `Available at ${testRequest.event_start} - ${testRequest.event_end} (${offset > 0 ? '+' : ''}${offset / 60}h shift)`
-        });
-
-        if (alternatives.length >= 5) break;
+        if (currentProjectors > maxProjectors ||
+            currentAudio > maxAudio ||
+            currentStaff > maxStaff) {
+          return false; // Capacity exceeded
+        }
+      } else {
+        currentProjectors -= event.projectors;
+        currentAudio -= event.audio;
+        currentStaff -= event.staff;
       }
     }
+
+    return true; // Resources available
   }
 
-  return alternatives;
-};
+  /**
+   * Validate booking request
+   * @param {object} request
+   * @returns {Promise<Array<string>>} Validation errors
+   */
+  async validateBookingRequest(request) {
+    const errors = [];
+
+    // Check operating hours
+    const { reservedStart, reservedEnd } = calculateReservedInterval(
+      request.event_date,
+      request.event_start,
+      request.event_end
+    );
+
+    if (!isWithinOperatingHours(reservedStart, reservedEnd)) {
+      errors.push(
+        `Event with setup and cleanup (${reservedStart} - ${reservedEnd}) ` +
+        `falls outside operating hours (08:00 - 22:00)`
+      );
+    }
+
+    return errors;
+  }
+
+  /**
+   * Generate detailed rejection reason
+   * @param {object} client
+   * @param {object} request
+   * @returns {Promise<string>}
+   */
+  async generateRejectionReason(client, request) {
+    const { reservedStart, reservedEnd } = calculateReservedInterval(
+      request.event_date,
+      request.event_start,
+      request.event_end
+    );
+
+    const venuesResult = await client.query('SELECT id, name FROM venues ORDER BY id');
+    const reasons = [];
+
+    for (const venue of venuesResult.rows) {
+      const halls = await bookingRepo.getHallsByCapacity(client, venue.id, request.attendees);
+
+      if (halls.length === 0) {
+        reasons.push(`${venue.name}: No hall with capacity for ${request.attendees} attendees`);
+        continue;
+      }
+
+      let anyHallAvailable = false;
+      for (const hall of halls) {
+        const available = await bookingRepo.isHallAvailable(
+          client,
+          hall.id,
+          request.event_date,
+          reservedStart,
+          reservedEnd,
+          null
+        );
+        if (available) {
+          anyHallAvailable = true;
+          break;
+        }
+      }
+
+      if (!anyHallAvailable) {
+        reasons.push(`${venue.name}: All suitable halls booked during ${reservedStart}-${reservedEnd}`);
+        continue;
+      }
+
+      const resourcesAvailable = await this.checkResourceAvailability(client, {
+        venueId: venue.id,
+        eventDate: request.event_date,
+        reservedStart,
+        reservedEnd,
+        projectorsRequested: request.projectors_requested,
+        audioSystemsRequested: request.audio_systems_requested,
+        staffRequested: request.staff_requested,
+        excludeBookingId: null
+      });
+
+      if (!resourcesAvailable) {
+        reasons.push(`${venue.name}: Insufficient resources during requested time`);
+      }
+    }
+
+    return reasons.length > 0
+      ? `Cannot accommodate request. ${reasons.join('; ')}`
+      : 'No suitable venue, hall, and resource combination available';
+  }
+
+  /**
+   * Build resource allocations array
+   * @param {object} client
+   * @param {object} resources
+   * @returns {Promise<Array>}
+   */
+  async buildResourceAllocations(client, resources) {
+    const allocations = [];
+
+    const typesResult = await client.query('SELECT id, name FROM resource_types');
+    const typeMap = {};
+    typesResult.rows.forEach(t => { typeMap[t.name] = t.id; });
+
+    if (resources.projectors_requested > 0) {
+      allocations.push({
+        resource_type_id: typeMap['projector'],
+        quantity: resources.projectors_requested
+      });
+    }
+
+    if (resources.audio_systems_requested > 0) {
+      allocations.push({
+        resource_type_id: typeMap['audio_system'],
+        quantity: resources.audio_systems_requested
+      });
+    }
+
+    if (resources.staff_requested > 0) {
+      allocations.push({
+        resource_type_id: typeMap['support_staff'],
+        quantity: resources.staff_requested
+      });
+    }
+
+    return allocations;
+  }
+
+  /**
+   * Cancel a booking
+   * @param {number} bookingId
+   * @param {string} reason
+   * @param {string} correlationId
+   * @returns {Promise<object>}
+   */
+  async cancelBooking(bookingId, reason = null, correlationId = null) {
+    return await transaction(async (client) => {
+      const booking = await bookingRepo.cancelBooking(client, bookingId, reason);
+
+      logger.info('Booking cancelled', {
+        bookingId,
+        reason,
+        correlationId
+      });
+
+      return {
+        success: true,
+        booking,
+        message: 'Booking cancelled successfully. Resources have been released.'
+      };
+    });
+  }
+
+  /**
+   * Reschedule a booking (atomic operation)
+   * @param {number} bookingId
+   * @param {object} newRequest
+   * @param {string} correlationId
+   * @returns {Promise<object>}
+   */
+  async rescheduleBooking(bookingId, newRequest, correlationId = null) {
+    const validated = bookingRequestSchema.parse(newRequest);
+
+    return await withRetry(async () => {
+      return await transaction(async (client) => {
+        // Get original booking
+        const originalResult = await client.query(
+          'SELECT * FROM bookings WHERE id = $1 AND status = $2',
+          [bookingId, 'confirmed']
+        );
+
+        if (originalResult.rows.length === 0) {
+          throw new Error('Booking not found or not in confirmed status');
+        }
+
+        const original = originalResult.rows[0];
+
+        // Acquire lock
+        const locked = await bookingRepo.acquireAllocationLock(
+          client,
+          validated.preferred_venue_id,
+          validated.event_date
+        );
+
+        if (!locked) {
+          throw new Error('Unable to acquire resource lock for rescheduling');
+        }
+
+        // Calculate new reserved interval
+        const { reservedStart, reservedEnd } = calculateReservedInterval(
+          validated.event_date,
+          validated.event_start,
+          validated.event_end
+        );
+
+        // Find available hall (excluding current booking)
+        const allocation = await this.findAvailableHall(client, {
+          ...validated,
+          reservedStart,
+          reservedEnd,
+          exclude_booking_id: bookingId
+        });
+
+        if (!allocation) {
+          const rejectionReason = await this.generateRejectionReason(client, validated);
+
+          await bookingRepo.createAuditEvent(client, {
+            event_type: 'booking_reschedule_failed',
+            booking_id: bookingId,
+            correlation_id: correlationId,
+            event_data: { reason: rejectionReason }
+          });
+
+          return {
+            success: false,
+            booking: original,
+            message: `Cannot reschedule: ${rejectionReason}`
+          };
+        }
+
+        // Update booking
+        const resourceAllocations = await this.buildResourceAllocations(client, {
+          projectors_requested: validated.projectors_requested,
+          audio_systems_requested: validated.audio_systems_requested,
+          staff_requested: validated.staff_requested
+        });
+
+        const updatedBooking = await bookingRepo.updateBooking(
+          client,
+          bookingId,
+          {
+            hall_id: allocation.hallId,
+            venue_id: allocation.venueId,
+            event_name: validated.event_name,
+            event_date: validated.event_date,
+            event_start: validated.event_start,
+            event_end: validated.event_end,
+            reserved_start: reservedStart,
+            reserved_end: reservedEnd,
+            attendees: validated.attendees
+          },
+          resourceAllocations
+        );
+
+        await bookingRepo.createAuditEvent(client, {
+          event_type: 'booking_reschedule_succeeded',
+          booking_id: bookingId,
+          correlation_id: correlationId,
+          event_data: { newVenueId: allocation.venueId, newHallId: allocation.hallId }
+        });
+
+        logger.info('Booking rescheduled', {
+          bookingId,
+          newVenueId: allocation.venueId,
+          newHallId: allocation.hallId,
+          correlationId
+        });
+
+        return {
+          success: true,
+          booking: updatedBooking,
+          message: `Booking rescheduled to ${allocation.venueName} - ${allocation.hallName}`
+        };
+      });
+    }, { maxRetries: 3 });
+  }
+
+  /**
+   * Get alternative time slots
+   * @param {object} request
+   * @returns {Promise<Array>}
+   */
+  async getAlternativeSlots(request) {
+    const alternatives = [];
+    const timeOffsets = [60, -60, 120, -120, 180, -180]; // ±1h, ±2h, ±3h in minutes
+
+    for (const offset of timeOffsets) {
+      const [startHour, startMin] = request.event_start.split(':').map(Number);
+      const [endHour, endMin] = request.event_end.split(':').map(Number);
+
+      const newStartHour = startHour + Math.floor(offset / 60);
+      const newEndHour = endHour + Math.floor(offset / 60);
+
+      if (newStartHour >= 0 && newStartHour < 24 && newEndHour >= 0 && newEndHour < 24) {
+        const testRequest = {
+          ...request,
+          event_start: `${String(newStartHour).padStart(2, '0')}:${String(startMin).padStart(2, '0')}`,
+          event_end: `${String(newEndHour).padStart(2, '0')}:${String(endMin).padStart(2, '0')}`
+        };
+
+        try {
+          const result = await this.confirmBooking(testRequest);
+
+          if (result.success) {
+            alternatives.push({
+              event_date: testRequest.event_date,
+              event_start: testRequest.event_start,
+              event_end: testRequest.event_end,
+              venue_id: result.allocation.venueId,
+              venue_name: result.allocation.venueName,
+              hall_name: result.allocation.hallName,
+              reason: `Available at ${testRequest.event_start}-${testRequest.event_end} (${offset > 0 ? '+' : ''}${offset / 60}h shift)`
+            });
+
+            // Rollback the test booking
+            await this.cancelBooking(result.booking.id, 'Test booking for alternatives');
+
+            if (alternatives.length >= 5) break;
+          }
+        } catch (error) {
+          // Ignore validation errors for alternative slots
+          continue;
+        }
+      }
+    }
+
+    return alternatives;
+  }
+}
+
+export default new SchedulingService();
