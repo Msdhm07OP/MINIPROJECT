@@ -1,0 +1,30 @@
+{
+  "name": "eventsync-backend",
+  "version": "1.0.0",
+  "description": "EventSync - Multi-Client Event Scheduling Backend",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "seed": "node seed.js",
+    "test": "node tests/scheduling.test.js"
+  },
+  "keywords": [
+    "event",
+    "scheduling",
+    "resource-management"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.5",
+    "date-fns": "^3.0.6",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.2"
+  }
+}
